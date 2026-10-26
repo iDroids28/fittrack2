@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import time
 import tkinter as tk
 import webbrowser
 from tkinter import ttk, messagebox
@@ -19,22 +20,26 @@ DB_PATH = APP_DIR / "fittrack.db"
 VIDEO_CONFIG_PATH = APP_DIR / "exercise_videos.json"
 VIDEO_DIR = APP_DIR / "videos"
 
-# ---------------------------------------------------------------- theme (white + blue)
-BG = "#f4f7fb"          # main workspace
-SIDEBAR = "#ffffff"
-PANEL = "#ffffff"
-PANEL_2 = "#eef3fa"     # inputs / secondary surfaces
-BORDER = "#d5deea"
-TEXT = "#14213d"        # dark navy
-MUTED = "#5f6f86"
-BLUE = "#2563eb"        # primary
-BLUE_DARK = "#1d4ed8"
-BLUE_LIGHT = "#dbeafe"  # selected cards / active nav
-HERO = "#e8f1ff"
-HERO_BORDER = "#c7dbfb"
-RED = "#d64545"
-OK = "#16a34a"
-GREEN = BLUE            # legacy alias so older helper calls keep working
+# ---------------------------------------------------------------- theme (soft blue neumorphism)
+# Tkinter widgets are opaque, so the frosted/blurred feel is simulated with a
+# misty blue-gray canvas tone, close surface shades, and very soft borders.
+BG = "#e7eef8"                # pale blue workspace; intentionally not pure white
+SIDEBAR = "#e4ecf7"           # softly separated navigation rail
+PANEL = "#eef4fb"             # raised card surface
+PANEL_2 = "#e1eaf6"           # recessed inputs / secondary controls
+BORDER = "#d0dceb"
+NEUMO_HIGHLIGHT = "#f8fbff"   # light edge of raised surfaces
+NEUMO_SHADOW = "#cdd9e8"      # cool, subtle shadow edge
+TEXT = "#1d2d46"             # ink navy
+MUTED = "#6b7b92"
+BLUE = "#3974de"              # calm blue primary
+BLUE_DARK = "#2d5fc2"
+BLUE_LIGHT = "#dce8fb"        # selected cards / active nav
+HERO = "#dfebfb"
+HERO_BORDER = "#ccdcf3"
+RED = "#c94f5b"
+OK = "#218760"
+GREEN = BLUE                  # legacy alias so older helper calls keep working
 GREEN_DARK = BLUE_LIGHT
 
 MAX_ROUTINE_EXERCISES = 20
@@ -84,7 +89,10 @@ def normalize_email(email: str) -> str:
 
 def validate_email(email: str) -> str | None:
     """Return an error message, or None when the address looks valid."""
-    email = normalize_email(email)
+    raw = email or ""
+    if any(c.isspace() for c in raw):
+        return "Email cannot contain spaces."
+    email = normalize_email(raw)
     if not email:
         return "Enter your email address."
     if len(email) > 254 or not EMAIL_RE.match(email):
@@ -92,13 +100,80 @@ def validate_email(email: str) -> str | None:
     return None
 
 
-def password_checks(password: str, confirm: str = "") -> list[tuple[str, bool]]:
+NAME_RE = re.compile(r"^[^\W\d_]+(?:(?:\. ?|[ '\-])[^\W\d_]+)*\.?$", re.UNICODE)
+
+
+def validate_display_name(name: str) -> str | None:
+    """Letters (incl. accents), single spaces, apostrophes, hyphens and periods; 2-40 characters."""
+    name = (name or "").strip()
+    if not name:
+        return "Enter your display name."
+    if len(name) < 2:
+        return "Display name must be at least 2 characters."
+    if len(name) > 40:
+        return "Display name must be 40 characters or fewer."
+    if not NAME_RE.match(name):
+        return "Display name can only contain letters, spaces, apostrophes, hyphens and periods."
+    return None
+
+
+PASSWORD_MIN, PASSWORD_MAX = 8, 64
+
+# --- live keystroke filters used by FitTrackApp.entry(kind=...) -----------------------------
+_EMAIL_CHARS = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]*$")
+_NAME_LIVE = re.compile(r"^[^\W\d_]*(?:[ '.\-][^\W\d_]*)*$", re.UNICODE)
+INPUT_KINDS = {
+    # kind: (max length, predicate on the would-be text)
+    "email":   (254, lambda t: bool(_EMAIL_CHARS.match(t)) and t.count("@") <= 1),
+    "name":    (40,  lambda t: (t == "" or t[0].isalpha()) and not re.search(r"[ '.\-]{2}", t.replace(". ", ".")) and bool(_NAME_LIVE.match(t))),
+    "password": (PASSWORD_MAX, lambda t: t.isprintable() and not any(c.isspace() for c in t)),
+    "age":     (3,   lambda t: t.isdigit() or t == ""),
+    "height":  (5,   lambda t: bool(re.fullmatch(r"\d{0,3}(\.\d?)?", t))),
+    "weight":  (6,   lambda t: bool(re.fullmatch(r"\d{0,3}(\.\d?)?", t))),
+    "setkg":   (7,   lambda t: bool(re.fullmatch(r"\d{0,4}(\.\d{0,2})?", t))),
+    "reps":    (4,   lambda t: t.isdigit() or t == ""),
+    "routine": (80,  lambda t: not t.startswith(" ") and "  " not in t and all(c.isprintable() for c in t)),
+    "search":  (60,  lambda t: not t.startswith(" ") and all(c.isprintable() for c in t)),
+}
+
+
+COMMON_PASSWORDS = {
+    "password", "password1", "password123", "passw0rd", "p@ssw0rd", "p@ssword1", "qwerty", "qwerty123", "qwertyuiop",
+    "123456", "1234567", "12345678", "123456789", "1234567890", "111111", "000000", "abc123", "abcd1234", "iloveyou",
+    "admin", "admin123", "welcome", "welcome1", "letmein", "monkey", "dragon", "football", "baseball", "superman",
+    "login", "master", "sunshine", "princess", "trustno1", "fittrack", "fittrack123", "workout", "gym123", "changeme",
+}
+_SEQUENCES = ("abcdefghijklmnopqrstuvwxyz", "0123456789", "qwertyuiop", "asdfghjkl", "zxcvbnm")
+
+
+def _has_sequence(pw: str, run: int = 4) -> bool:
+    """True for keyboard / alphabet / number runs such as abcd, 4321, qwer (forward or backward)."""
+    low = pw.lower()
+    for seq in _SEQUENCES:
+        for chunk in (seq, seq[::-1]):
+            for i in range(len(chunk) - run + 1):
+                if chunk[i:i + run] in low:
+                    return True
+    return False
+
+
+def _personal_bits(email: str = "", name: str = "") -> list[str]:
+    bits = []
+    local = normalize_email(email).split("@")[0]
+    if len(local) >= 4:
+        bits.append(local)
+    bits += [w.lower() for w in re.split(r"[^\w]+", name or "") if len(w) >= 3]
+    return bits
+
+
+def password_checks(password: str, confirm: str = "", email: str = "", name: str = "") -> list[tuple[str, bool]]:
+    """Signup rules: length, mixed case, number, and special character."""
     checks = [
-        ("At least 8 characters", len(password) >= 8),
-        ("Contains a letter", any(c.isalpha() for c in password)),
-        ("Contains a number", any(c.isdigit() for c in password)),
-        ("Contains a special character", any(not c.isalnum() and not c.isspace() for c in password)),
-        ("No spaces", not any(c.isspace() for c in password)),
+        (f"{PASSWORD_MIN} to {PASSWORD_MAX} characters", PASSWORD_MIN <= len(password) <= PASSWORD_MAX),
+        ("An uppercase letter (A-Z)", any(c.isupper() for c in password)),
+        ("A lowercase letter (a-z)", any(c.islower() for c in password)),
+        ("A number (0-9)", any(c.isdigit() for c in password)),
+        ("A special character (e.g. ! @ # $ %)", any(not c.isalnum() and not c.isspace() for c in password)),
     ]
     if confirm != "":
         checks.append(("Passwords match", password == confirm))
@@ -544,7 +619,14 @@ class FitTrackDB:
         return self.conn.execute("SELECT 1 FROM users WHERE email=?", (normalize_email(email),)).fetchone() is not None
 
     def create_user(self, email: str, display_name: str, password: str):
+        err = validate_email(email) or validate_display_name(display_name)
+        if err:
+            raise ValueError(err)
+        failed = [t for t, ok in password_checks(password, "", email, display_name) if not ok]
+        if failed:
+            raise ValueError("Your password still needs: " + "; ".join(t.lower() for t in failed) + ".")
         email = normalize_email(email)
+        display_name = " ".join(display_name.split())
         if self.email_exists(email):
             return None
         salt, digest = self._hash_password(password)
@@ -764,6 +846,76 @@ class ScrollFrame(tk.Frame):
     def to_top(self):
         self.canvas.yview_moveto(0)
 
+    def see(self, widget, pad=24):
+        """Scroll just enough so `widget` is fully visible (used for keyboard/Tab navigation)."""
+        try:
+            self.update_idletasks()
+            total = float(self.canvas.bbox("all")[3])
+            view_h = self.canvas.winfo_height()
+            if total <= view_h:
+                return
+            top = widget.winfo_rooty() - self.inner.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            cur_top = self.canvas.canvasy(0)
+            cur_bottom = cur_top + view_h
+            if top - pad < cur_top:
+                self.canvas.yview_moveto(max(0.0, (top - pad) / total))
+            elif bottom + pad > cur_bottom:
+                self.canvas.yview_moveto(min(1.0, (bottom + pad - view_h) / total))
+        except tk.TclError:
+            pass
+
+# ======================================================================
+# Neumorphic card shell
+# ======================================================================
+class NeumoCard(tk.Frame):
+    """Pale-blue card with a light upper/left edge and cool lower/right shadow.
+
+    This approximates Neumorphism using native Tkinter frames, so no dependency
+    is required. Tkinter does not support true frosted-glass background blur.
+    """
+
+    def __init__(self, parent, padx=18, pady=17, **kwargs):
+        kwargs.pop("bg", None)
+        kwargs.pop("background", None)
+        kwargs.pop("highlightbackground", None)
+        kwargs.pop("highlightcolor", None)
+        kwargs.pop("highlightthickness", None)
+        # The outer shell is what the page packs/grids; its two-pixel border
+        # creates a subtle raised edge without changing the card's inner layout.
+        self._neumo_shell = tk.Frame(parent, bg=NEUMO_SHADOW, bd=0, highlightthickness=0)
+        self._neumo_highlight = tk.Frame(self._neumo_shell, bg=NEUMO_HIGHLIGHT, bd=0, highlightthickness=0)
+        self._neumo_highlight.place(x=0, y=0, relwidth=1, relheight=1, width=-2, height=-2)
+        super().__init__(self._neumo_shell, bg=PANEL, padx=padx, pady=pady,
+                         bd=0, highlightthickness=0, relief="flat", **kwargs)
+        # Pack the content frame inside its shell using the base-class method;
+        # public pack/grid calls below are delegated to the outer shell.
+        tk.Frame.pack(self, fill="both", expand=True, padx=1, pady=1)
+
+    def pack(self, **kwargs):
+        return self._neumo_shell.pack(**kwargs)
+
+    def pack_configure(self, **kwargs):
+        return self._neumo_shell.pack_configure(**kwargs)
+
+    def pack_forget(self):
+        return self._neumo_shell.pack_forget()
+
+    def pack_info(self):
+        return self._neumo_shell.pack_info()
+
+    def grid(self, **kwargs):
+        return self._neumo_shell.grid(**kwargs)
+
+    def grid_configure(self, **kwargs):
+        return self._neumo_shell.grid_configure(**kwargs)
+
+    def grid_forget(self):
+        return self._neumo_shell.grid_forget()
+
+    def grid_info(self):
+        return self._neumo_shell.grid_info()
+
 # ======================================================================
 # Application
 # ======================================================================
@@ -794,31 +946,102 @@ class FitTrackApp(tk.Tk):
         style = ttk.Style(self)
         try: style.theme_use("clam")
         except tk.TclError: pass
-        style.configure("Treeview", background=PANEL, foreground=TEXT, fieldbackground=PANEL, rowheight=30, borderwidth=0)
-        style.configure("Treeview.Heading", background=BLUE_LIGHT, foreground=BLUE_DARK, relief="flat", font=("Segoe UI", 9, "bold"))
+        style.configure(
+            "Treeview", background=PANEL, foreground=TEXT, fieldbackground=PANEL,
+            rowheight=34, borderwidth=0, relief="flat", font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Treeview.Heading", background=BLUE_LIGHT, foreground=BLUE_DARK,
+            relief="flat", padding=(10, 9), font=("Segoe UI", 9, "bold"),
+        )
         style.map("Treeview", background=[("selected", BLUE_LIGHT)], foreground=[("selected", TEXT)])
-        style.configure("TCombobox", fieldbackground=PANEL_2, background=PANEL_2, foreground=TEXT, arrowcolor=BLUE, bordercolor=BORDER)
+        style.configure(
+            "TCombobox", fieldbackground=PANEL_2, background=PANEL_2, foreground=TEXT,
+            arrowcolor=BLUE, bordercolor=BORDER, lightcolor=NEUMO_HIGHLIGHT,
+            darkcolor=NEUMO_SHADOW, padding=7, relief="flat",
+        )
         style.map("TCombobox", fieldbackground=[("readonly", PANEL_2)], foreground=[("readonly", TEXT)])
-        style.configure("Vertical.TScrollbar", background=BORDER, troughcolor=PANEL_2, arrowcolor=MUTED, bordercolor=PANEL_2)
+        style.configure(
+            "Vertical.TScrollbar", background=PANEL_2, troughcolor=BG, arrowcolor=MUTED,
+            bordercolor=BG, relief="flat", gripcount=0,
+        )
+        style.configure(
+            "Horizontal.TScrollbar", background=PANEL_2, troughcolor=BG, arrowcolor=MUTED,
+            bordercolor=BG, relief="flat", gripcount=0,
+        )
+        style.configure(
+            "TProgressbar", background=BLUE, troughcolor=PANEL_2,
+            bordercolor=BG, lightcolor=BLUE, darkcolor=BLUE, thickness=8,
+        )
         self.option_add("*TCombobox*Listbox.background", PANEL)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.option_add("*TCombobox*Listbox.selectBackground", BLUE_LIGHT)
         self.option_add("*TCombobox*Listbox.selectForeground", TEXT)
 
     def button(self, parent, text, command, primary=False, **kwargs):
-        return tk.Button(parent, text=text, command=command, bg=BLUE if primary else PANEL_2, fg="#ffffff" if primary else TEXT,
-                         activebackground=BLUE_DARK if primary else BLUE_LIGHT, activeforeground="#ffffff" if primary else TEXT,
-                         disabledforeground="#9fb4d9" if primary else MUTED,
-                         relief="flat", bd=0, cursor="hand2", font=("Segoe UI", 10, "bold"), padx=14, pady=10, **kwargs)
+        """Soft, rounded-looking button with a subtle hover lift (Tkinter approximation)."""
+        base_bg = BLUE if primary else PANEL_2
+        base_fg = "#ffffff" if primary else TEXT
+        btn = tk.Button(
+            parent, text=text, command=command, bg=base_bg, fg=base_fg,
+            activebackground=BLUE_DARK if primary else BLUE_LIGHT,
+            activeforeground="#ffffff" if primary else TEXT,
+            disabledforeground="#a5b4c9" if primary else MUTED,
+            relief="flat", bd=0, highlightthickness=0,
+            cursor="hand2", font=("Segoe UI", 10, "bold"), padx=14, pady=10,
+            **kwargs,
+        )
+
+        def hover_in(_event):
+            if str(btn.cget("state")) == "disabled":
+                return
+            original = btn.cget("bg")
+            btn._ft_hover_original = original
+            try:
+                rgb = tuple(int(original[i:i + 2], 16) for i in (1, 3, 5))
+                # Mix the current surface with white very gently for a soft lift.
+                lifted = tuple(round(v + (255 - v) * 0.13) for v in rgb)
+                btn.configure(bg="#{:02x}{:02x}{:02x}".format(*lifted))
+            except (ValueError, tk.TclError):
+                btn.configure(bg=BLUE_LIGHT)
+
+        def hover_out(_event):
+            original = getattr(btn, "_ft_hover_original", None)
+            if original and str(btn.cget("state")) != "disabled":
+                try:
+                    btn.configure(bg=original)
+                except tk.TclError:
+                    pass
+
+        btn.bind("<Enter>", hover_in, add="+")
+        btn.bind("<Leave>", hover_out, add="+")
+        return btn
 
     def label(self, parent, text, size=10, color=TEXT, bold=False, **kwargs):
         return tk.Label(parent, text=text, bg=kwargs.pop("bg", parent.cget("bg") if hasattr(parent, "cget") else BG), fg=color,
                         font=("Segoe UI", size, "bold" if bold else "normal"), **kwargs)
 
-    def entry(self, parent, textvariable=None, width=None, show=None, no_space=False):
-        e = tk.Entry(parent, textvariable=textvariable, width=width, show=show, bg=PANEL_2, fg=TEXT, insertbackground=BLUE,
-                     relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER, highlightcolor=BLUE,
-                     font=("Segoe UI", 11))
+    def entry(self, parent, textvariable=None, width=None, show=None, no_space=False, kind=None):
+        e = tk.Entry(
+            parent, textvariable=textvariable, width=width, show=show,
+            bg=PANEL_2, fg=TEXT, insertbackground=BLUE,
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=NEUMO_SHADOW, highlightcolor=BLUE,
+            font=("Segoe UI", 11),
+        )
+        e.bind("<FocusIn>", lambda _ev, w=e: w.configure(highlightthickness=2, highlightbackground=BLUE), add="+")
+        e.bind("<FocusOut>", lambda _ev, w=e: w.configure(highlightthickness=1, highlightbackground=NEUMO_SHADOW), add="+")
+        if kind in INPUT_KINDS:
+            # Live input validation: characters that would make the field invalid never get in
+            # (typed, pasted or dropped); pasted text is cleaned and trimmed to fit.
+            maxlen, ok = INPUT_KINDS[kind]
+            allow = lambda t, ok=ok, m=maxlen: len(t) <= m and ok(t)
+            e.configure(validate="key", validatecommand=(self.register(allow), "%P"))
+            if kind in ("email", "password"):
+                e.bind("<space>", lambda _e: "break")
+            paste = lambda ev, k=kind: self._paste_filtered(ev.widget, k)
+            for seq in ("<<Paste>>", "<Control-v>", "<Control-V>"):
+                e.bind(seq, paste)
         if no_space:
             # Block the space bar and strip whitespace from pasted text.
             e.bind("<space>", lambda _e: "break")
@@ -826,6 +1049,29 @@ class FitTrackApp(tk.Tk):
             e.bind("<Control-v>", lambda ev: self._paste_no_space(ev.widget))
             e.bind("<Control-V>", lambda ev: self._paste_no_space(ev.widget))
         return e
+
+    def _paste_filtered(self, widget, kind):
+        """Paste clipboard text one character at a time, keeping only what the field allows."""
+        maxlen, ok = INPUT_KINDS[kind]
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if kind in ("email", "password", "age", "height", "weight", "setkg", "reps"):
+            text = "".join(text.split())          # no whitespace at all in these fields
+        else:
+            text = " ".join(text.split())         # collapse newlines / tabs / runs of spaces
+        try:
+            if widget.selection_present():
+                widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        for ch in text:
+            cur, i = widget.get(), widget.index("insert")
+            new = cur[:i] + ch + cur[i:]
+            if len(new) <= maxlen and ok(new):
+                widget.insert("insert", ch)
+        return "break"
 
     def _paste_no_space(self, widget):
         """Paste clipboard text with all whitespace removed."""
@@ -841,10 +1087,10 @@ class FitTrackApp(tk.Tk):
         widget.insert("insert", text)
         return "break"
 
-    def field(self, parent, caption, variable=None, show=None, width=32, no_space=False):
+    def field(self, parent, caption, variable=None, show=None, width=32, no_space=False, kind=None):
         wrap = tk.Frame(parent, bg=parent.cget("bg"))
         self.label(wrap, caption, 9, MUTED, True).pack(anchor="w", pady=(0, 6))
-        ent = self.entry(wrap, variable, width, show, no_space=no_space)
+        ent = self.entry(wrap, variable, width, show, no_space=no_space, kind=kind)
         ent.pack(fill="x", ipady=10)
         return wrap, ent
 
@@ -854,7 +1100,7 @@ class FitTrackApp(tk.Tk):
         return cb
 
     def card(self, parent, **kwargs):
-        return tk.Frame(parent, bg=PANEL, padx=18, pady=17, highlightbackground=BORDER, highlightthickness=1, **kwargs)
+        return NeumoCard(parent, padx=18, pady=17, **kwargs)
 
     def metric_card(self, parent, title, value, note):
         f = self.card(parent)
@@ -899,32 +1145,36 @@ class FitTrackApp(tk.Tk):
         for child in self.winfo_children(): child.destroy()
         root = tk.Frame(self, bg=BG)
         root.pack(fill="both", expand=True)
-        LEFT, ROW = BLUE_DARK, "#2f63e6"
-        left = tk.Frame(root, bg=LEFT, width=510, padx=45, pady=40)
+        LEFT, ROW = "#e0e9f7", "#e9f0fa"
+        left = tk.Frame(root, bg=LEFT, width=510, padx=45, pady=40,
+                        highlightbackground=NEUMO_SHADOW, highlightthickness=1)
         left.pack(side="left", fill="both", expand=True)
         left.pack_propagate(False)
-        mark = tk.Frame(left, bg="#ffffff", width=45, height=45)
+        mark = tk.Frame(left, bg=PANEL, width=47, height=47,
+                        highlightbackground=NEUMO_SHADOW, highlightthickness=1)
         mark.pack(anchor="w")
         mark.pack_propagate(False)
-        tk.Label(mark, text="⚡", bg="#ffffff", fg=BLUE, font=("Segoe UI", 20, "bold")).place(relx=.5, rely=.5, anchor="center")
-        tk.Label(left, text="fittrack.", bg=LEFT, fg="#ffffff", font=("Segoe UI", 23, "bold")).pack(anchor="w", pady=(14, 0))
-        tk.Label(left, text="TRAIN WITH PURPOSE", bg=LEFT, fg="#bcd3ff", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        tk.Label(mark, text="⚡", bg=PANEL, fg=BLUE, font=("Segoe UI", 20, "bold")).place(relx=.5, rely=.5, anchor="center")
+        tk.Label(left, text="fittrack.", bg=LEFT, fg=TEXT, font=("Segoe UI", 23, "bold")).pack(anchor="w", pady=(14, 0))
+        tk.Label(left, text="TRAIN WITH PURPOSE", bg=LEFT, fg=BLUE, font=("Segoe UI", 8, "bold")).pack(anchor="w")
         tk.Frame(left, bg=LEFT, height=45).pack()
-        tk.Label(left, text="YOUR FITNESS, IN FOCUS", bg=LEFT, fg="#bcd3ff", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        tk.Label(left, text="Show up today.\nGet stronger tomorrow.", bg=LEFT, fg="#ffffff", font=("Segoe UI", 31, "bold"), justify="left").pack(anchor="w", pady=(16, 12))
-        tk.Label(left, text="Create routines, track your workouts, and celebrate progress — one rep at a time.", bg=LEFT, fg="#dbe7ff", font=("Segoe UI", 12), wraplength=410, justify="left").pack(anchor="w")
+        tk.Label(left, text="YOUR FITNESS, IN FOCUS", bg=LEFT, fg=BLUE_DARK, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tk.Label(left, text="Show up today.\nGet stronger tomorrow.", bg=LEFT, fg=TEXT, font=("Segoe UI", 31, "bold"), justify="left").pack(anchor="w", pady=(16, 12))
+        tk.Label(left, text="Create routines, track your workouts, and celebrate progress — one rep at a time.", bg=LEFT, fg=MUTED, font=("Segoe UI", 12), wraplength=410, justify="left").pack(anchor="w")
         for title, subtitle in [("Plan your workouts", "Routines that match your goals"), ("Track every set", "Weights, reps, and training volume"), ("See your progress", "Workout history and personal records")]:
-            row = tk.Frame(left, bg=ROW, padx=13, pady=12, highlightbackground="#5a86ee", highlightthickness=1)
+            row = tk.Frame(left, bg=ROW, padx=13, pady=12,
+                           highlightbackground=NEUMO_SHADOW, highlightcolor=NEUMO_HIGHLIGHT,
+                           highlightthickness=1)
             row.pack(fill="x", pady=(16, 0))
-            tk.Label(row, text="✓", fg="#ffffff", bg=ROW, font=("Segoe UI", 17, "bold")).pack(side="left", padx=(0, 12))
+            tk.Label(row, text="✓", fg=BLUE, bg=ROW, font=("Segoe UI", 17, "bold")).pack(side="left", padx=(0, 12))
             col = tk.Frame(row, bg=ROW); col.pack(side="left", fill="x")
-            tk.Label(col, text=title, bg=ROW, fg="#ffffff", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-            tk.Label(col, text=subtitle, bg=ROW, fg="#dbe7ff", font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+            tk.Label(col, text=title, bg=ROW, fg=TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            tk.Label(col, text=subtitle, bg=ROW, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
 
         # right side scrolls so the taller signup form still fits small windows
         self.auth_scroll = ScrollFrame(root, bg=BG, center=True)
         self.auth_scroll.pack(side="right", fill="both", expand=True)
-        card = tk.Frame(self.auth_scroll.inner, bg=PANEL, padx=28, pady=28, highlightbackground=BORDER, highlightthickness=1)
+        card = NeumoCard(self.auth_scroll.inner, padx=30, pady=30)
         card.pack(expand=True, fill="x", padx=35, pady=25)
         self.auth_card = card
         self._render_auth_card()
@@ -940,6 +1190,16 @@ class FitTrackApp(tk.Tk):
     def _render_auth_card(self):
         for child in self.auth_card.winfo_children(): child.destroy()
         signup = self.auth_signup
+        self.terms_accepted = False
+        self.terms_read = False
+        if signup:
+            back = self.button(self.auth_card, "←  Back to login", self._toggle_auth_mode)
+            back.configure(bg=PANEL, fg=BLUE, padx=0, pady=2, activebackground=PANEL, activeforeground=BLUE_DARK,
+                           font=("Segoe UI", 10, "bold"))
+            back.pack(anchor="w", pady=(0, 10))
+            self.bind("<Escape>", lambda _e: self._toggle_auth_mode() if self.auth_signup else None)
+        else:
+            self.unbind("<Escape>")
         self.label(self.auth_card, "YOUR PERSONAL WORKOUT SPACE", 9, BLUE, True).pack(anchor="w")
         self.label(self.auth_card, "Create your account" if signup else "Welcome back.", 23, TEXT, True).pack(anchor="w", pady=(12, 4))
         self.label(self.auth_card, "Sign up to start tracking." if signup else "Log in to continue your fitness journey.", 10, MUTED).pack(anchor="w", pady=(0, 18))
@@ -948,12 +1208,12 @@ class FitTrackApp(tk.Tk):
         self.auth_pass = tk.StringVar()
         self.auth_confirm = tk.StringVar()
         if signup:
-            wrap, _ = self.field(self.auth_card, "DISPLAY NAME", self.auth_name)
+            wrap, _ = self.field(self.auth_card, "DISPLAY NAME", self.auth_name, kind="name")
             wrap.pack(fill="x", pady=(0, 12))
-        wrap, self.email_entry = self.field(self.auth_card, "EMAIL", self.auth_email)
+        wrap, self.email_entry = self.field(self.auth_card, "EMAIL", self.auth_email, kind="email")
         wrap.pack(fill="x", pady=(0, 12))
         # Spaces are blocked only when creating an account; login stays open so older accounts still work.
-        wrap, self.password_entry = self.field(self.auth_card, "PASSWORD", self.auth_pass, show="•", no_space=signup)
+        wrap, self.password_entry = self.field(self.auth_card, "PASSWORD", self.auth_pass, show="•", kind="password")
         wrap.pack(fill="x", pady=(0, 2))
         self.show_password_var = self._show_toggle(self.auth_card, self.password_entry)
         self.auth_error_label = tk.Label(self.auth_card, text="", bg=PANEL, fg=RED, font=("Segoe UI", 9), wraplength=340, justify="left")
@@ -966,9 +1226,25 @@ class FitTrackApp(tk.Tk):
                 lbl = tk.Label(box, text="", bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w")
                 lbl.pack(fill="x"); self.indicator_labels.append(lbl)
             self.match_label = tk.Label(box, text="", bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w")
-            wrap, self.confirm_entry = self.field(self.auth_card, "CONFIRM PASSWORD", self.auth_confirm, show="•", no_space=True)
+            wrap, self.confirm_entry = self.field(self.auth_card, "CONFIRM PASSWORD", self.auth_confirm, show="•", kind="password")
             wrap.pack(fill="x", pady=(6, 2))
             self.show_confirm_var = self._show_toggle(self.auth_card, self.confirm_entry)
+
+            # Terms must be read to the bottom and explicitly accepted before signup is enabled.
+            terms_row = tk.Frame(self.auth_card, bg=PANEL)
+            terms_row.pack(fill="x", pady=(7, 10))
+            self.terms_status_label = tk.Label(
+                terms_row, text="Terms & Conditions not yet accepted", bg=PANEL, fg=MUTED,
+                font=("Segoe UI", 9), anchor="w", justify="left", wraplength=330,
+            )
+            self.terms_status_label.pack(anchor="w", fill="x", pady=(0, 5))
+            self.terms_button = self.button(terms_row, "READ TERMS & CONDITIONS", self._open_terms_dialog)
+            self.terms_button.configure(
+                bg=BLUE_LIGHT, fg=BLUE_DARK, activebackground=HERO, activeforeground=BLUE_DARK,
+                padx=10, pady=7, font=("Segoe UI", 9, "bold"),
+            )
+            self.terms_button.pack(anchor="w")
+
         self.auth_error_label.pack(anchor="w", pady=(0, 7))
         self.submit_btn = self.button(self.auth_card, "CREATE ACCOUNT" if signup else "LOG IN", self._submit_auth, primary=True)
         self.submit_btn.pack(fill="x")
@@ -977,7 +1253,7 @@ class FitTrackApp(tk.Tk):
         link = self.button(row, "Log in" if signup else "Sign up", self._toggle_auth_mode)
         link.configure(bg=PANEL, fg=BLUE, padx=8, pady=4, activebackground=PANEL, activeforeground=BLUE_DARK)
         link.pack(side="left")
-        self.label(self.auth_card, "Your workout data is saved in a local SQLite database on this computer.", 9, MUTED, wraplength=340, justify="center").pack(fill="x", pady=(14, 0))
+
         if signup:
             for v in (self.auth_name, self.auth_email, self.auth_pass, self.auth_confirm):
                 v.trace_add("write", lambda *_: self._update_signup_state())
@@ -985,15 +1261,29 @@ class FitTrackApp(tk.Tk):
         for w in (self.email_entry, self.password_entry):
             w.bind("<Return>", lambda _e: self._submit_auth())
         self.email_entry.focus_set()
+        # --- make the form scrollable: Tab/click scrolls the focused field into view, arrow/page keys scroll
+        sf = self.auth_scroll
+        sf.to_top()
+        def watch(widget):
+            if isinstance(widget, tk.Entry):
+                widget.bind("<FocusIn>", lambda _e, w=widget: sf.after(10, lambda: sf.see(w)), add="+")
+            for c in widget.winfo_children():
+                watch(c)
+        watch(self.auth_card)
+        self.bind("<Prior>", lambda _e: sf.canvas.yview_scroll(-1, "pages"))
+        self.bind("<Next>", lambda _e: sf.canvas.yview_scroll(1, "pages"))
+        self.bind("<Control-Home>", lambda _e: sf.to_top())
 
     def _update_signup_state(self):
         """Live password indicators + enable/disable the Create Account button."""
         if not self.auth_signup or not self.indicator_labels:
             return
         pw, confirm = self.auth_pass.get(), self.auth_confirm.get()
-        checks = password_checks(pw, confirm)
-        n = len(self.indicator_labels)  # 5 fixed rules; "Passwords match" is checks[5]
+        checks = password_checks(pw, confirm, self.auth_email.get(), self.auth_name.get())
+        n = len(self.indicator_labels)  # fixed visible rules; "Passwords match" is the entry right after them
+        checks = checks[:n] + [c for c in checks[n:] if c[0] == "Passwords match"]
         for lbl, (text, ok) in zip(self.indicator_labels, checks[:n]):
+            ok = ok and bool(pw)
             lbl.configure(text=("✓  " if ok else "○  ") + text, fg=OK if ok else (MUTED if not pw else RED))
         if confirm != "":
             text, ok = checks[n]
@@ -1002,8 +1292,139 @@ class FitTrackApp(tk.Tk):
                 self.match_label.pack(fill="x")
         else:
             self.match_label.pack_forget()
-        ready = all(ok for _, ok in checks) and confirm != "" and bool(self.auth_name.get().strip()) and bool(self.auth_email.get().strip())
+        ready = (all(ok for _, ok in checks) and confirm != ""
+                 and validate_display_name(self.auth_name.get()) is None
+                 and validate_email(self.auth_email.get()) is None
+                 and self.terms_accepted)
         self.submit_btn.configure(state="normal" if ready else "disabled", cursor="hand2" if ready else "arrow")
+
+    def _open_terms_dialog(self):
+        """Show Terms & Conditions; acceptance is unavailable until the reader reaches the end."""
+        if not self.auth_signup:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("FitTrack — Terms & Conditions")
+        dialog.configure(bg=BG)
+        dialog.geometry("650x650")
+        dialog.minsize(520, 520)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        outer = tk.Frame(dialog, bg=BG, padx=20, pady=18)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text="Terms & Conditions", bg=BG, fg=TEXT,
+                 font=("Segoe UI", 19, "bold")).pack(anchor="w")
+        tk.Label(outer, text="Please read these terms through to the end before accepting.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 12))
+
+        terms = """FITTRACK — TERMS & CONDITIONS
+
+1. USING FITTRACK
+By creating a FitTrack account, you agree to use the application responsibly and to provide information that is accurate to the best of your knowledge. Keep your login credentials private and do not use another person's account without permission.
+
+2. FITNESS INFORMATION IS GENERAL
+FitTrack provides workout ideas, exercise instructions, tracking tools, and recommendations for general informational purposes only. It is not medical advice, diagnosis, or treatment, and it cannot assess your individual medical condition.
+
+3. EXERCISE SAFELY
+Exercise carries physical risks. Choose activities and resistance that match your current ability, use suitable equipment, and prioritize controlled technique. Stop if you experience unusual pain, dizziness, chest discomfort, or other concerning symptoms, and seek appropriate professional help. Consult a qualified healthcare professional before starting a new exercise program if you have health concerns or have been advised to limit exercise. Ask a qualified trainer for help with unfamiliar movements when available.
+
+4. RECOMMENDATIONS AND RESULTS
+Workout recommendations, sets, repetitions, durations, and suggested resistance are estimates, not guarantees of safety or results. Height, weight, age, and experience alone cannot determine the exact load that is right for you. You are responsible for adjusting exercises to your ability and for not attempting a load or movement that feels unsafe.
+
+5. YOUR PROFILE AND WORKOUT RECORDS
+You are responsible for entering and updating your profile information and recording your workouts as accurately as possible. Incorrect information can affect the usefulness of recommendations and progress summaries.
+
+6. ACCOUNT AND DEVICE SECURITY
+Take reasonable care to secure the computer and account you use for FitTrack. Do not share your password. Anyone who can access your local application data or device may be able to access information stored there, so protect your device and keep backups when appropriate.
+
+7. ACCEPTABLE USE
+Do not attempt to disrupt the application, gain unauthorized access to accounts or data, or use FitTrack to harm others. Use the app in accordance with applicable rules and laws.
+
+8. CHANGES AND AVAILABILITY
+FitTrack features and recommendations may change as the application is updated. The application is provided as-is; uninterrupted availability, error-free operation, and particular fitness outcomes are not guaranteed.
+
+9. YOUR ACKNOWLEDGMENT
+By accepting, you confirm that you have scrolled through and reviewed these Terms & Conditions, understand that FitTrack does not provide medical advice, and agree to use the application responsibly.
+
+END OF TERMS & CONDITIONS
+"""
+        text_frame = tk.Frame(outer, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
+        text_frame.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+        reader = tk.Text(text_frame, wrap="word", state="normal", bg=PANEL, fg=TEXT,
+                         font=("Segoe UI", 10), padx=14, pady=12, relief="flat")
+        reader.pack(side="left", fill="both", expand=True)
+        reader.insert("1.0", terms)
+        reader.configure(state="disabled")
+        scrollbar.configure(command=reader.yview)
+
+        bottom = {"reached": False}
+        status = tk.Label(outer, text="Scroll to the bottom to enable acceptance.", bg=BG, fg=MUTED,
+                          font=("Segoe UI", 9), anchor="w")
+        status.pack(fill="x", pady=(10, 4))
+        agree_var = tk.BooleanVar(value=False)
+        agree = tk.Checkbutton(
+            outer, text="I have read and agree to the Terms & Conditions", variable=agree_var,
+            state="disabled", command=lambda: update_accept_state(), bg=BG, fg=TEXT,
+            activebackground=BG, activeforeground=BLUE, selectcolor=PANEL_2,
+            disabledforeground=MUTED, font=("Segoe UI", 10), cursor="hand2",
+        )
+        agree.pack(anchor="w")
+        actions = tk.Frame(outer, bg=BG)
+        actions.pack(fill="x", pady=(12, 0))
+
+        def update_accept_state():
+            accept_btn.configure(state="normal" if bottom["reached"] and agree_var.get() else "disabled")
+
+        def on_scroll(first, last):
+            try:
+                scrollbar.set(first, last)
+            except tk.TclError:
+                return
+            # Ignore initial layout callbacks: the document must be scrolled in a visible reader.
+            try:
+                reader_is_visible = reader.winfo_height() > 80
+            except tk.TclError:
+                reader_is_visible = False
+            if reader_is_visible and float(last) >= 0.995 and not bottom["reached"]:
+                bottom["reached"] = True
+                agree.configure(state="normal")
+                status.configure(text="You reached the end. You may now accept the terms.", fg=OK)
+            update_accept_state()
+
+        def accept_terms():
+            if not bottom["reached"] or not agree_var.get():
+                return
+            self.terms_read = True
+            self.terms_accepted = True
+            if hasattr(self, "terms_status_label") and self.terms_status_label.winfo_exists():
+                self.terms_status_label.configure(text="✓ Terms & Conditions accepted", fg=OK)
+            if hasattr(self, "terms_button") and self.terms_button.winfo_exists():
+                self.terms_button.configure(text="REVIEW TERMS & CONDITIONS")
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+            self._update_signup_state()
+
+        def exit_terms():
+            # Leaving the dialog never counts as accepting the terms.
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        accept_btn = self.button(actions, "ACCEPT & CONTINUE", accept_terms, primary=True)
+        accept_btn.configure(state="disabled")
+        accept_btn.pack(side="right")
+        # The native window close (X) and Escape key exit this dialog without accepting.
+        dialog.protocol("WM_DELETE_WINDOW", exit_terms)
+        dialog.bind("<Escape>", lambda _e: exit_terms())
+        reader.configure(yscrollcommand=on_scroll)
+        dialog.after_idle(lambda: reader.yview_moveto(0))
 
     def _set_auth_msg(self, text, ok=False):
         self.auth_error_label.configure(text=text, fg=OK if ok else RED)
@@ -1016,18 +1437,25 @@ class FitTrackApp(tk.Tk):
         email = normalize_email(self.auth_email.get())
         password = self.auth_pass.get()
         if self.auth_signup:
-            name = self.auth_name.get().strip()
-            if not name:
-                self._set_auth_msg("Enter your display name."); return
+            if not getattr(self, "terms_accepted", False):
+                self._set_auth_msg("Please read and accept the Terms & Conditions before creating an account.")
+                return
+            name = " ".join(self.auth_name.get().split())
+            err = validate_display_name(name)
+            if err:
+                self._set_auth_msg(err); return
             err = validate_email(email)
             if err:
                 self._set_auth_msg(err); return
-            failed = [t for t, ok in password_checks(password) if not ok]
+            failed = [t for t, ok in password_checks(password, "", email, name) if not ok]
             if failed:
                 self._set_auth_msg("Your password still needs: " + "; ".join(t.lower() for t in failed) + "."); return
             if password != self.auth_confirm.get():
                 self._set_auth_msg("The passwords do not match. Please re-enter them."); return
-            uid = self.db.create_user(email, name, password)
+            try:
+                uid = self.db.create_user(email, name, password)
+            except ValueError as err:
+                self._set_auth_msg(str(err)); return
             if not uid:
                 self._set_auth_msg("That email is already registered. Try logging in instead."); return
             # Registration does not sign the user in: return to the login form.
@@ -1037,13 +1465,26 @@ class FitTrackApp(tk.Tk):
             self._set_auth_msg("Account created successfully. Please log in to continue.", ok=True)
             self.password_entry.focus_set()
             return
-        if not email:
-            self._set_auth_msg("Enter your email address."); return
+        err = validate_email(self.auth_email.get())
+        if err:
+            self._set_auth_msg(err); return
         if not password:
             self._set_auth_msg("Enter your password."); return
+        if any(c.isspace() for c in password) or len(password) > PASSWORD_MAX:
+            self._set_auth_msg("Email or password is incorrect."); return
+        # Throttle guessing: 5 wrong attempts -> 30 second pause.
+        wait = getattr(self, "_login_lock_until", 0) - time.monotonic()
+        if wait > 0:
+            self._set_auth_msg(f"Too many failed attempts. Try again in {int(wait) + 1} seconds."); return
         self.user = self.db.verify_user(email, password)
         if not self.user:
+            self._login_fails = getattr(self, "_login_fails", 0) + 1
+            if self._login_fails >= 5:
+                self._login_fails = 0
+                self._login_lock_until = time.monotonic() + 30
+                self._set_auth_msg("Too many failed attempts. Please wait 30 seconds and try again."); return
             self._set_auth_msg("Email or password is incorrect."); return
+        self._login_fails = 0
         self._after_login()
 
     # ------------------------------------------------------------ shell / navigation
@@ -1061,7 +1502,7 @@ class FitTrackApp(tk.Tk):
             return  # never reach the dashboard without a login and a completed profile
         for child in self.winfo_children(): child.destroy()
         shell = tk.Frame(self, bg=BG); shell.pack(fill="both", expand=True)
-        sidebar = tk.Frame(shell, bg=SIDEBAR, width=235, padx=15, pady=20, highlightbackground=BORDER, highlightthickness=1)
+        sidebar = tk.Frame(shell, bg=SIDEBAR, width=235, padx=15, pady=20, highlightbackground=NEUMO_SHADOW, highlightthickness=1)
         sidebar.pack(side="left", fill="y"); sidebar.pack_propagate(False)
         tk.Label(sidebar, text="⚡  fittrack.", bg=SIDEBAR, fg=BLUE, font=("Segoe UI", 22, "bold")).pack(anchor="w", padx=7, pady=(4, 1))
         tk.Label(sidebar, text="TRAIN WITH PURPOSE", bg=SIDEBAR, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=9, pady=(0, 24))
@@ -1071,10 +1512,15 @@ class FitTrackApp(tk.Tk):
         for name, icon in nav_items:
             row = tk.Frame(sidebar, bg=SIDEBAR); row.pack(fill="x", pady=2)
             ind = tk.Frame(row, bg=SIDEBAR, width=4); ind.pack(side="left", fill="y")
-            b = tk.Button(row, text=f"{icon}   {name}", command=lambda n=name: self.show_page(n), anchor="w", bg=SIDEBAR, fg=TEXT,
-                          activebackground=BLUE_LIGHT, activeforeground=BLUE, relief="flat", bd=0, padx=12, pady=10,
-                          font=("Segoe UI", 10, "bold"), cursor="hand2")
+            b = tk.Button(
+                row, text=f"{icon}   {name}", command=lambda n=name: self.show_page(n), anchor="w",
+                bg=SIDEBAR, fg=TEXT, activebackground=BLUE_LIGHT, activeforeground=BLUE,
+                relief="flat", bd=0, highlightthickness=0, padx=12, pady=10,
+                font=("Segoe UI", 10, "bold"), cursor="hand2",
+            )
             b.pack(side="left", fill="x", expand=True)
+            b.bind("<Enter>", lambda _e, w=b, n=name: w.configure(bg=BLUE_LIGHT if n == self.page else PANEL_2), add="+")
+            b.bind("<Leave>", lambda _e: self._highlight_nav(self.page), add="+")
             self.nav_buttons[name] = (ind, b)
         bottom = tk.Frame(sidebar, bg=SIDEBAR); bottom.pack(side="bottom", fill="x", pady=5)
         tk.Frame(bottom, bg=BORDER, height=1).pack(fill="x", pady=(0, 12))
@@ -1131,11 +1577,11 @@ class FitTrackApp(tk.Tk):
         method()
 
     # ------------------------------------------------------------ required profile setup
-    def _unit_field(self, parent, caption, var, unit):
+    def _unit_field(self, parent, caption, var, unit, kind=None):
         wrap = tk.Frame(parent, bg=parent.cget("bg"))
         self.label(wrap, caption, 9, MUTED, True).pack(anchor="w", pady=(0, 6))
         row = tk.Frame(wrap, bg=parent.cget("bg")); row.pack(fill="x")
-        ent = self.entry(row, var, 12); ent.pack(side="left", fill="x", expand=True, ipady=9)
+        ent = self.entry(row, var, 12, kind=kind); ent.pack(side="left", fill="x", expand=True, ipady=9)
         self.label(row, unit, 10, BLUE, True, bg=parent.cget("bg")).pack(side="left", padx=(10, 0))
         return wrap, ent
 
@@ -1155,7 +1601,7 @@ class FitTrackApp(tk.Tk):
              "level": tk.StringVar(value=p["experience_level"]), "confirm": tk.BooleanVar(value=False)}
         self.setup_vars = v
         for cap, key, unit in (("AGE", "age", "years"), ("HEIGHT", "height", "cm"), ("WEIGHT", "weight", "kg")):
-            wrap, ent = self._unit_field(card, cap + " *", v[key], unit); wrap.pack(fill="x", pady=(0, 12))
+            wrap, ent = self._unit_field(card, cap + " *", v[key], unit, kind=key); wrap.pack(fill="x", pady=(0, 12))
             if key == "age": ent.focus_set()
         self.label(card, "FITNESS GOAL", 9, MUTED, True).pack(anchor="w", pady=(0, 5))
         self.combo(card, v["goal"], GOALS).pack(fill="x", ipady=5, pady=(0, 12))
@@ -1372,7 +1818,7 @@ class FitTrackApp(tk.Tk):
         if requested_focus not in ROUTINE_FOCUSES:
             requested_focus = focus_aliases.get(requested_focus, "Full body")
         focus_var = tk.StringVar(value=requested_focus)
-        wrap, _ = self.field(outer, "ROUTINE NAME", name_var); wrap.pack(fill="x", pady=(10, 8))
+        wrap, _ = self.field(outer, "ROUTINE NAME", name_var, kind="routine"); wrap.pack(fill="x", pady=(10, 8))
         top = tk.Frame(outer, bg=BG); top.pack(fill="x")
         self.label(top, "TRAINING FOCUS", 9, MUTED, True).pack(anchor="w", pady=(0, 5))
         focus_row = tk.Frame(top, bg=BG); focus_row.pack(fill="x")
@@ -1467,7 +1913,7 @@ class FitTrackApp(tk.Tk):
         def save():
             ids = [eid for eid in display_order if variables[eid].get()]
             try:
-                self.db.create_routine(uid, name_var.get(), focus_var.get(), ids)
+                self.db.create_routine(uid, " ".join(name_var.get().split()), focus_var.get(), ids)
             except ValueError as err:
                 messagebox.showwarning("Check your routine", str(err), parent=win); return
             win.destroy(); self.show_page("Routines")
@@ -1482,7 +1928,7 @@ class FitTrackApp(tk.Tk):
     def page_library(self):
         self.heading("Learn the movement", "Exercise library", "Search exercises, preview the video spot, and open a step-by-step tutorial.")
         row = tk.Frame(self.content, bg=BG); row.pack(fill="x", pady=(0, 10))
-        q = tk.StringVar(); search = self.entry(row, q); search.pack(side="left", fill="x", expand=True, ipady=10, padx=(0, 10))
+        q = tk.StringVar(); search = self.entry(row, q, kind="search"); search.pack(side="left", fill="x", expand=True, ipady=10, padx=(0, 10))
         self.button(row, "Search", lambda: render()).pack(side="left")
         sf = ScrollFrame(self.content, bg=BG); sf.pack(fill="both", expand=True)
         listbox = sf.inner
@@ -1609,8 +2055,8 @@ class FitTrackApp(tk.Tk):
         tk.Label(row, text=f"{number:02d}", width=5, anchor="w", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=3)
         tk.Label(row, text=rec["reps_text"], width=14, anchor="w", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=3)
         weight = tk.StringVar(value="0"); reps = tk.StringVar(value=str((rec["lo"] + rec["hi"]) // 2)); done = tk.BooleanVar(value=False)
-        ew = self.entry(row, weight, width=10); ew.pack(side="left", padx=3, ipady=5)
-        er = self.entry(row, reps, width=8); er.pack(side="left", padx=3, ipady=5)
+        ew = self.entry(row, weight, width=10, kind="setkg"); ew.pack(side="left", padx=3, ipady=5)
+        er = self.entry(row, reps, width=8, kind="reps"); er.pack(side="left", padx=3, ipady=5)
         tk.Checkbutton(row, variable=done, bg=PANEL, activebackground=PANEL, selectcolor=BLUE_LIGHT, text="Done", fg=TEXT).pack(side="left", padx=8)
         fb = tk.Label(row, text="", bg=PANEL, fg=MUTED, font=("Segoe UI", 8), wraplength=280, justify="left", anchor="w")
         fb.pack(side="left", padx=4, fill="x", expand=True)
@@ -1668,7 +2114,7 @@ class FitTrackApp(tk.Tk):
     def page_history(self):
         self.heading("Every session counts", "Workout history", "Review past sessions saved to your FitTrack database.")
         bar = tk.Frame(self.content, bg=BG); bar.pack(fill="x", pady=(0, 10))
-        q = tk.StringVar(); ent = self.entry(bar, q); ent.pack(side="left", fill="x", expand=True, ipady=9, padx=(0, 8))
+        q = tk.StringVar(); ent = self.entry(bar, q, kind="search"); ent.pack(side="left", fill="x", expand=True, ipady=9, padx=(0, 8))
         row = tk.Frame(self.content, bg=BG); row.pack(side="bottom", fill="x", pady=10)
         wrap, tree = self._tree_with_scroll(self.content, ("date", "routine", "duration", "sets", "volume"), 15)
         wrap.pack(fill="both", expand=True)
@@ -1733,20 +2179,24 @@ class FitTrackApp(tk.Tk):
         name = tk.StringVar(value=p["display_name"]); goal = tk.StringVar(value=p["fitness_goal"]); level = tk.StringVar(value=p["experience_level"])
         target = tk.IntVar(value=p["weekly_target"]); weight = tk.StringVar(value=fmt(p["body_weight"])); height = tk.StringVar(value=fmt(p["height_cm"]))
         gender = tk.StringVar(value=p["gender"] or "Prefer not to say"); age = tk.StringVar(value=fmt(p["age"]))
-        wrap, _ = self.field(form, "DISPLAY NAME", name); wrap.pack(fill="x", pady=(0, 13))
+        wrap, _ = self.field(form, "DISPLAY NAME", name, kind="name"); wrap.pack(fill="x", pady=(0, 13))
         for cap, var, vals in [("FITNESS GOAL", goal, GOALS), ("EXPERIENCE LEVEL", level, LEVELS), ("WEEKLY WORKOUT TARGET (SESSIONS)", target, [1, 2, 3, 4, 5, 6, 7]), ("GENDER (OPTIONAL)", gender, GENDERS)]:
             self.label(form, cap, 9, MUTED, True).pack(anchor="w", pady=(0, 5))
             self.combo(form, var, vals).pack(fill="x", ipady=5, pady=(0, 13))
-        wrap, _ = self._unit_field(form, "AGE (REQUIRED)", age, "years"); wrap.pack(fill="x", pady=(0, 13))
-        wrap, _ = self._unit_field(form, "HEIGHT (REQUIRED)", height, "cm"); wrap.pack(fill="x", pady=(0, 13))
-        wrap, _ = self._unit_field(form, "WEIGHT (REQUIRED)", weight, "kg"); wrap.pack(fill="x", pady=(0, 8))
+        wrap, _ = self._unit_field(form, "AGE (REQUIRED)", age, "years", kind="age"); wrap.pack(fill="x", pady=(0, 13))
+        wrap, _ = self._unit_field(form, "HEIGHT (REQUIRED)", height, "cm", kind="height"); wrap.pack(fill="x", pady=(0, 13))
+        wrap, _ = self._unit_field(form, "WEIGHT (REQUIRED)", weight, "kg", kind="weight"); wrap.pack(fill="x", pady=(0, 8))
         self.label(form, "Age, height and weight are required. They add context to your recommendations but never set exact lifting loads, and gender does not change your sets, reps or weights.", 8, MUTED, wraplength=700, justify="left").pack(anchor="w", pady=(0, 14))
         def save():
+            err = validate_display_name(name.get())
+            if err:
+                messagebox.showwarning("Check your profile", err); return
+            name.set(" ".join(name.get().split()))
             try:
                 self.db.save_profile(self.user["id"], name.get(), goal.get(), level.get(), int(target.get()), weight.get(), height.get(), gender.get(), age.get())
             except (ValueError, tk.TclError) as err:
                 messagebox.showwarning("Check your profile", str(err) if isinstance(err, ValueError) else "Check the weekly target value."); return
-            self.user["display_name"] = name.get().strip() or "Athlete"
+            self.user["display_name"] = name.get().strip()
             messagebox.showinfo("Profile saved", "Your profile has been saved and your recommendations have been refreshed.")
             self.show_page("Profile")
         self.button(form, "Save profile", save, primary=True).pack(anchor="w")
